@@ -1,78 +1,146 @@
-from twikit import Client, TooManyRequests
-import time
-from datetime import datetime
 import csv
-from configparser import ConfigParser
-from random import randint
+import time
+import yaml
+import asyncio
+from datetime import datetime
+from twikit import Client, TooManyRequests
+import sys
+import os
+import logging
+from tqdm.asyncio import tqdm_asyncio
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from utils.neural_delay_model import predict_delay
+from utils.relevance_classifier import is_relevant
 
-MINIMUM_TWEETS = 10
-QUERY = '(from:elonmusk) lang:en until:2020-01-01 since:2018-01-01'
+# ✅ Setup logging
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+logging.basicConfig(
+    filename=os.path.join(log_dir, "scraper_errors.log"),
+    level=logging.ERROR,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
+success_log_file = os.path.join(log_dir, "scraper_success.log")
 
-def get_tweets(tweets):
-    if tweets is None:
-        #* get tweets
-        print(f'{datetime.now()} - Getting tweets...')
-        tweets = client.search_tweet(QUERY, product='Top')
-    else:
-        wait_time = randint(5, 10)
-        print(f'{datetime.now()} - Getting next tweets after {wait_time} seconds ...')
-        time.sleep(wait_time)
-        tweets = tweets.next()
+def log_success(message):
+    with open(success_log_file, "a") as f:
+        f.write(f"{datetime.now()} - {message}\n")
 
-    return tweets
+# ✅ Load settings.yaml
+with open("settings.yaml", "r") as f:
+    config = yaml.safe_load(f)
 
+# ✅ Load progress if any
+progress_file = "scrape_progress.txt"
+last_scraped_index = 0
+if os.path.exists(progress_file):
+    with open(progress_file, "r") as pf:
+        last_scraped_index = int(pf.read().strip())
 
-#* login credentials
-config = ConfigParser()
-config.read('config.ini')
-username = config['X']['username']
-email = config['X']['email']
-password = config['X']['password']
+# ✅ Cookie rotation setup
+cookie_files = [
+    "cookies_economicswebweb.json",
+    "cookies_sapandeepss.json",
+    "cookies_deepsolo297699.json"
+]
 
-#* create a csv file
-with open('tweets.csv', 'w', newline='') as file:
-    writer = csv.writer(file)
-    writer.writerow(['Tweet_count', 'Username', 'Text', 'Created At', 'Retweets', 'Likes'])
+# ✅ Scraping logic
+async def scrape():
+    total_handles = len(config["query_list"])
+    cookie_index = 0
 
+    for i in tqdm_asyncio(range(last_scraped_index, total_handles), desc="Scraping Progress"):
+        handle = config["query_list"][i]["handle"]
+        print(f"\n📦 Scraping @{handle} with account {cookie_files[cookie_index]}...")
 
+        client = Client(language="en-US")
+        client.load_cookies(cookie_files[cookie_index])
 
-#* authenticate to X.com
-#! 1) use the login credentials. 2) use cookies.
-client = Client(language='en-US')
-# client.login(auth_info_1=username, auth_info_2=email, password=password)
-# client.save_cookies('cookies.json')
+        try:
+            user = await client.get_user_by_screen_name(handle)
+            tweets = await user.get_tweets(tweet_type="Tweets")
+            tweet_count = 0
+            filename = f"data/tweets_{handle}.csv"
+            empty_cycles = 0
 
-client.load_cookies('cookies.json')
+            with open(filename, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Username", "Created At", "Text", "Likes", "Retweets"])
 
-tweet_count = 0
-tweets = None
+            while tweet_count < config["min_tweets"]:
+                batch_collected = 0
+                for tweet in tweets:
+                    if not is_relevant(tweet.text):
+                        continue
+                    tweet_count += 1
+                    batch_collected += 1
+                    tweet_data = [handle, tweet.created_at, tweet.text, tweet.favorite_count, tweet.retweet_count]
+                    with open(filename, "a", newline="", encoding="utf-8") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(tweet_data)
 
-while tweet_count < MINIMUM_TWEETS:
+                if batch_collected == 0:
+                    empty_cycles += 1
+                else:
+                    empty_cycles = 0
 
-    try:
-        tweets = get_tweets(tweets)
-    except TooManyRequests as e:
-        rate_limit_reset = datetime.fromtimestamp(e.rate_limit_reset)
-        print(f'{datetime.now()} - Rate limit reached. Waiting until {rate_limit_reset}')
-        wait_time = rate_limit_reset - datetime.now()
-        time.sleep(wait_time.total_seconds())
-        continue
+                if empty_cycles >= 2:
+                    print(f"⚠️ No tweets for @{handle} after 5 tries. Skipping.")
+                    break
 
-    if not tweets:
-        print(f'{datetime.now()} - No more tweets found')
-        break
+                print(f"{datetime.now()} - {handle}: {tweet_count} tweets collected.")
+                delay = predict_delay({
+                    "time": datetime.now().hour,
+                    "tweets_scraped": tweet_count,
+                    "is_switch": False
+                })
+                print(f"⏳ Sleeping {delay}s to mimic human behavior...")
+                await asyncio.sleep(delay)
+                tweets = await tweets.next()
 
-    for tweet in tweets:
-        tweet_count += 1
-        tweet_data = [tweet_count, tweet.user.name, tweet.text, tweet.created_at, tweet.retweet_count, tweet.favorite_count]
-        
-        with open('tweets.csv', 'a', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(tweet_data)
+            with open(progress_file, "w") as pf:
+                pf.write(str(i + 1))
 
-    print(f'{datetime.now()} - Got {tweet_count} tweets')
+            log_success(f"✅ @{handle} scraped successfully with {tweet_count} tweets.")
 
+        except TooManyRequests as e:
+            print(f"🚫 Rate limit hit. Sleeping until {e.rate_limit_reset}")
+            from datetime import datetime as dt
+            reset_time = dt.fromtimestamp(e.rate_limit_reset)
+            wait_time = (reset_time - dt.now()).total_seconds()
+            wait_time = max(wait_time, 60)
+            print(f"🕒 Waiting {wait_time:.2f} seconds due to rate limit...")
+            await asyncio.sleep(wait_time)
 
-print(f'{datetime.now()} - Done! Got {tweet_count} tweets found')
+        except Exception as ex:
+            logging.error(f"Error scraping @{handle}: {ex}")
+            print(f"❌ Error scraping {handle}: {ex}")
+
+        # ✅ Rotate account every 5 users or manually
+        if (i + 1) % 5 == 0:
+            cookie_index = (cookie_index + 1) % len(cookie_files)
+            print(f"🔄 Rotating account to: {cookie_files[cookie_index]}")
+            await asyncio.sleep(predict_delay({"is_switch": True}))
+
+# ✅ CSV Merging logic
+
+def merge_all_tweet_csvs():
+    import glob
+    import pandas as pd
+
+    all_files = glob.glob("data/tweets_*.csv")
+    if not all_files:
+        print("⚠️ No tweet CSVs found to merge.")
+        return
+
+    df_list = [pd.read_csv(f) for f in all_files]
+    combined = pd.concat(df_list, ignore_index=True)
+    combined.to_csv("data/all_tweets_combined.csv", index=False)
+    print(f"✅ Merged {len(df_list)} files into data/all_tweets_combined.csv")
+
+# ✅ Entry point
+if __name__ == "__main__":
+    asyncio.run(scrape())
+    merge_all_tweet_csvs()
